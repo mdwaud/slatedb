@@ -1983,6 +1983,51 @@ mod tests {
         kv_store.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn test_manual_flush() {
+        // open a db with flush_interval set to None
+        let db_options = DbOptions {
+            flush_interval: None,
+            ..test_db_options(0, 1024, None)
+        };
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let kv_store = Db::open_with_opts(
+            Path::from("/tmp/test_kv_store"),
+            db_options.clone(),
+            object_store.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Create a new WriteBatch
+        let mut batch = WriteBatch::new();
+        batch.put(b"key1", b"value1");
+        batch.put(b"key2", b"value2");
+        batch.delete(b"key1");
+
+        // Write the batch
+        kv_store.write(batch).await.expect("write batch failed");
+
+        // manually flush the batch, close the db
+        kv_store.flush().await.expect("flush failed");
+        kv_store.close().await.expect("close failed");
+
+        // Reopen the db
+        let kv_store =
+            Db::open_with_opts(Path::from("/tmp/test_kv_store"), db_options, object_store)
+                .await
+                .unwrap();
+
+        // Read back keys
+        assert_eq!(kv_store.get(b"key1").await.unwrap(), None);
+        assert_eq!(
+            kv_store.get(b"key2").await.unwrap(),
+            Some(Bytes::from_static(b"value2"))
+        );
+
+        kv_store.close().await.unwrap();
+    }
+
     #[cfg(feature = "wal_disable")]
     #[tokio::test]
     async fn test_write_batch_without_wal() {
