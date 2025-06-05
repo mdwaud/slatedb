@@ -31,7 +31,7 @@ use bytes::Bytes;
 /// writes can exceed `l0_sst_size_bytes` (when `WAL` is disabled). It also
 /// means that WAL SSTs could get large if there's a large batch write.
 pub struct WriteBatch {
-    pub(crate) ops: Vec<WriteOp>,
+    pub ops: Vec<WriteOp>,
 }
 
 impl Default for WriteBatch {
@@ -40,7 +40,7 @@ impl Default for WriteBatch {
     }
 }
 
-pub(crate) enum WriteOp {
+pub enum WriteOp {
     Put(Bytes, Bytes, PutOptions),
     Delete(Bytes),
 }
