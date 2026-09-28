@@ -54,7 +54,7 @@ use crate::config::{
 use crate::db_common::extract_segment_prefix;
 use crate::db_iter::{DbIterator, DbRecencyIterator};
 use crate::db_snapshot::DbSnapshot;
-use crate::db_state::{collect_touched_segments, DbState, SsTableId};
+use crate::db_state::{collect_touched_segments, DbState, SsTableHandle, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, VersionedManifest};
@@ -786,7 +786,7 @@ impl Db {
     /// ```
     pub async fn snapshot(&self) -> Result<Arc<DbSnapshot>, crate::Error> {
         self.inner.check_closed()?;
-        let snapshot = DbSnapshot::new(self.inner.clone(), None);
+        let snapshot = DbSnapshot::new(self.inner.clone(), None)?;
         Ok(snapshot)
     }
 
@@ -2054,11 +2054,20 @@ impl DbCacheManagerOps for Db {
             .await
     }
 
-    async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), crate::Error> {
+    async fn evict_cached_sst(
+        &self,
+        sst: &SsTableHandle,
+        targets: &[CacheTarget],
+    ) -> Result<(), crate::Error> {
         self.inner.check_closed()?;
         let manifest = self.manifest();
-        db_cache_manager::evict_cached_sst_impl(&self.inner.table_store, manifest.core(), sst_id)
-            .await
+        db_cache_manager::evict_cached_sst_impl(
+            &self.inner.table_store,
+            manifest.core(),
+            sst,
+            targets,
+        )
+        .await
     }
 
     async fn flush_cache_to_disk(&self) -> Result<(), crate::Error> {
@@ -3899,7 +3908,13 @@ mod tests {
         let index = db
             .inner
             .table_store
-            .read_index(&view.sst, true, Some(Bytes::new()))
+            .read_index(
+                &view.sst,
+                true,
+                Some(Bytes::new()),
+                &crate::reader::ReadTrace::new(None),
+                None,
+            )
             .await
             .unwrap();
         assert!(!index.borrow().block_meta().is_empty());
@@ -7690,7 +7705,8 @@ mod tests {
 
         db.merge(b"k", b"1").await.unwrap();
         let snapshot = db.snapshot().await.unwrap();
-        let snapshot_seq = db.inner.oracle.last_committed_seq();
+        // note: for retention, SnapshotManager tracks the lowest sequence_number, which is the remote sequence number
+        let snapshot_seq = snapshot.remote_seq();
         db.flush().await.unwrap();
 
         for operand in [b"2", b"3", b"4", b"5", b"6"] {
@@ -7879,7 +7895,7 @@ mod tests {
         db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let snapshot = db.snapshot().await.unwrap();
-        let snapshot_seq = snapshot.seq();
+        let snapshot_seq = snapshot.memory_seq();
 
         db.put(b"key2", b"value2").await.unwrap();
         db.inner.flush_memtables(FlushTarget::All).await.unwrap();
@@ -7943,7 +7959,7 @@ mod tests {
         db.inner.flush_memtables(FlushTarget::All).await.unwrap();
 
         let snapshot = db.snapshot().await.unwrap();
-        let snapshot_seq = snapshot.seq();
+        let snapshot_seq = snapshot.memory_seq();
 
         assert_eq!(db.inner.txn_manager.min_active_seq(), Some(txn_seq));
         assert_eq!(
