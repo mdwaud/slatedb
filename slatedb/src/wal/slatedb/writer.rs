@@ -486,8 +486,7 @@ struct WalFlushHandler {
     table_store: Arc<WalTableStore>,
     stats: Arc<WalBufferStats>,
     listener: Option<wal::WalStatusListener>,
-    /// Sends each flushed WAL to an in-process consumer. Configured with
-    /// [`crate::DbBuilder::with_wal_flush_sender`].
+    /// The consumer channel set by [`crate::DbBuilder::with_wal_flush_sender`], if any
     flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
 }
 
@@ -548,24 +547,22 @@ impl WalFlushHandler {
         Ok(())
     }
 
-    /// Sends the flushed WAL to the consumer channel, if one is configured. Never blocks and
-    /// never fails. A full channel drops the message and increments a counter. The consumer sees
-    /// the gap as a jump in `wal_id`. A closed channel is ignored.
+    /// Sends a flushed WAL to the consumer channel, if one is configured. Never blocks and never
+    /// fails: a full channel drops the message and counts it, and a closed channel is ignored.
     ///
-    /// Consumes the caller's reference to the buffer. `record_flushed_wal` has already released
-    /// the queue's reference, so this is normally the last one and the rows move into the
-    /// message. They are copied only if some other holder still has the buffer.
+    /// Takes the caller's reference to the buffer. `record_flushed_wal` already released the
+    /// queue's reference, so this is normally the last one and the rows move into the message.
     fn send_flushed_wal(&self, wal_id: u64, wal: Arc<WalBuffer>) {
         let Some(tx) = self.flushed_wal_tx.as_ref() else {
             return;
         };
-        // A frozen WAL always holds at least one row, so this never returns early.
+        // a frozen WAL always holds at least one row
         let (Some(first), Some(last)) = (wal.entries.front(), wal.entries.back()) else {
             debug_assert!(false, "flushed an empty wal buffer [wal_id={}]", wal_id);
             return;
         };
         let (first_seq, last_seq) = (first.seq, last.seq);
-        // Reserve a slot before taking the rows, so that a lagging consumer costs nothing.
+        // reserve a slot before taking the rows so that a lagging consumer costs nothing
         let permit = match tx.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
@@ -580,6 +577,7 @@ impl WalFlushHandler {
         };
         let rows = match Arc::try_unwrap(wal) {
             Ok(buffer) => Vec::from(buffer.entries),
+            // some other holder still has the buffer, so copy the rows instead
             Err(wal) => wal.entries.iter().cloned().collect(),
         };
         permit.send(Arc::new(FlushedWal {

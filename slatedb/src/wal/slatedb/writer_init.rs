@@ -22,8 +22,7 @@ pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
-    /// Receives one message per flushed WAL file. Set by
-    /// [`crate::DbBuilder::with_wal_flush_sender`].
+    /// Set by [`crate::DbBuilder::with_wal_flush_sender`]. Comes from the caller, not [`Settings`]
     flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
 }
 

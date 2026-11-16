@@ -181,31 +181,25 @@ pub struct WalStatus {
     pub buffered_wal_entries_count: usize,
 }
 
-/// A WAL file that SlateDB's built-in WAL has flushed to durable storage.
+/// The contents of a durably flushed WAL file
 ///
-/// Configure a channel with
-/// [`DbBuilder::with_wal_flush_sender`](crate::DbBuilder::with_wal_flush_sender) to receive one
-/// `FlushedWal` per flushed WAL file. SlateDB sends the message after the upload succeeds, at the
-/// point the write becomes durable.
-///
-/// SlateDB never blocks a write to send a message. If the channel is full, SlateDB drops the
-/// message. The consumer sees the gap as a jump in [`FlushedWal::wal_id`] and reads the missing
-/// files with [`WalReader`](crate::WalReader).
+/// Sent to the channel registered with
+/// [`DbBuilder::with_wal_flush_sender`](crate::DbBuilder::with_wal_flush_sender)
 #[derive(Clone, PartialEq)]
 pub struct FlushedWal {
-    /// The id of the WAL file that holds these rows.
+    /// The id of the WAL file that holds these rows
     pub wal_id: u64,
-    /// The sequence number of the first row.
+    /// The sequence number of the first row
     pub first_seq: u64,
-    /// The sequence number of the last row.
+    /// The sequence number of the last row
     pub last_seq: u64,
-    /// The rows in the WAL file, in sequence number order. All rows of one write batch share a
-    /// sequence number and are in the same `FlushedWal`.
+    /// The rows in the WAL file, in sequence number order. All the rows with a given sequence
+    /// number are present in the same [`FlushedWal`].
     pub rows: Vec<RowEntry>,
 }
 
-/// Prints the row count and sequence range instead of the rows, so that formatting a message
-/// cannot dump a whole WAL file of keys and values into a log.
+/// Prints the row count in place of the rows. A derived [`Debug`] would log a whole WAL file of
+/// keys and values.
 impl Debug for FlushedWal {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlushedWal")

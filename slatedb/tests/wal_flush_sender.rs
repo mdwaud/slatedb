@@ -1,6 +1,5 @@
 #![allow(clippy::disallowed_types, clippy::disallowed_methods)]
-//! Tests for `DbBuilder::with_wal_flush_sender`, which lets an in-process consumer tail the
-//! database's committed, durable writes.
+//! Tests for `DbBuilder::with_wal_flush_sender`, which tails the database's durable writes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +10,7 @@ use slatedb::object_store::ObjectStore;
 use slatedb::{Db, FlushedWal, WalReader, WriteBatch};
 use tokio::sync::mpsc;
 
-/// Settings that leave every WAL flush under the test's control. The flush interval is off and
-/// the WAL size limit is large, so only an explicit flush writes a WAL file.
+/// No flush interval and a large WAL size limit, so only an explicit flush writes a WAL file
 fn manual_flush_settings() -> Settings {
     Settings {
         flush_interval: None,
@@ -35,8 +33,7 @@ async fn open_db(
         .unwrap()
 }
 
-/// Opens a database on a fresh in-memory store with a consumer channel of `capacity`, and leaves
-/// every WAL flush under the test's control.
+/// Opens a db on a fresh in-memory store with a consumer channel of `capacity`
 async fn open_tailing_db(path: &str, capacity: usize) -> (Db, mpsc::Receiver<Arc<FlushedWal>>) {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (tx, rx) = mpsc::channel(capacity);
@@ -44,8 +41,7 @@ async fn open_tailing_db(path: &str, capacity: usize) -> (Db, mpsc::Receiver<Arc
     (db, rx)
 }
 
-/// Flushes the WAL explicitly. The tests pin `FlushType::Wal` rather than calling `Db::flush`,
-/// because the WAL flush is the behaviour under test.
+/// Pins `FlushType::Wal` rather than calling `Db::flush`, because the WAL flush is under test
 async fn flush_wal(db: &Db) {
     db.flush_with_options(FlushOptions {
         flush_type: FlushType::Wal,
