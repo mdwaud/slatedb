@@ -50,6 +50,23 @@ async fn flush_wal(db: &Db) {
     .unwrap();
 }
 
+/// Drains the channel and reports whether it closed, rather than stalling
+async fn recv_closed(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> bool {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .is_ok()
+}
+
+async fn flush_result_is_err(db: &Db) -> bool {
+    db.flush_with_options(FlushOptions {
+        flush_type: FlushType::Wal,
+    })
+    .await
+    .is_err()
+}
+
 async fn recv(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> Arc<FlushedWal> {
     tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
@@ -270,4 +287,65 @@ async fn test_messages_sent_for_interval_and_explicit_flushes() {
     assert_eq!(message.rows[0].key.as_ref(), b"explicit");
 
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_channel_closes_when_the_db_closes() {
+    // given: a db with undelivered messages in the consumer channel
+    let (db, mut rx) = open_tailing_db("/test_close_signal", 16).await;
+    for i in 0..3u8 {
+        db.put([b'k', i], b"v").await.unwrap();
+        flush_wal(&db).await;
+    }
+
+    // when: the db closes
+    db.close().await.unwrap();
+
+    // then: the consumer drains every message, then sees the channel close
+    let mut wal_ids = Vec::new();
+    while let Some(message) = rx.recv().await {
+        wal_ids.push(message.wal_id);
+    }
+    assert_eq!(wal_ids.len(), 3, "close must not discard buffered messages");
+    assert!(wal_ids.windows(2).all(|pair| pair[1] == pair[0] + 1));
+}
+
+#[tokio::test]
+async fn test_channel_closes_when_the_writer_is_fenced() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "/test_fenced_signal";
+
+    // given: a writer that has flushed one wal file
+    let (tx, mut rx) = mpsc::channel(16);
+    let fenced = open_db(path, object_store.clone(), manual_flush_settings(), tx).await;
+    fenced.put(b"a", b"1").await.unwrap();
+    flush_wal(&fenced).await;
+    let message = recv(&mut rx).await;
+
+    // when: a second writer opens on the same path and fences the first
+    let (tx, mut rx2) = mpsc::channel(16);
+    let writer = open_db(path, object_store, manual_flush_settings(), tx).await;
+
+    // then: the fenced writer cannot flush its next write, and its consumer sees the channel
+    // close. The write itself still succeeds, because it only reaches the in-memory buffer.
+    fenced.put(b"never", b"durable").await.unwrap();
+    assert!(flush_result_is_err(&fenced).await);
+    assert!(
+        recv_closed(&mut rx).await,
+        "a fenced writer must close its consumer channel"
+    );
+
+    // and: the new writer's first wal file lands after the fencing wal file
+    writer.put(b"b", b"2").await.unwrap();
+    flush_wal(&writer).await;
+    let next = recv(&mut rx2).await;
+    assert!(
+        next.wal_id > message.wal_id + 1,
+        "the fencing wal file should sit between {} and {}",
+        message.wal_id,
+        next.wal_id
+    );
+    assert_eq!(next.first_seq, message.last_seq + 1);
+
+    writer.close().await.unwrap();
 }

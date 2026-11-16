@@ -300,15 +300,12 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// database's durable writes in sequence number order from the writer process.
     /// One [`FlushedWal`] is sent per WAL file, after its upload succeeds.
     ///
-    /// The send never blocks or fails a write. A full channel drops the message and
-    /// counts it in `slatedb.wal.flushed_wal_drops`; a closed channel is ignored.
-    /// The consumer detects a drop as a jump in [`FlushedWal::wal_id`] and reads the
-    /// missing files with [`crate::WalReader`]. The consumer owns the channel and
-    /// picks its capacity, which bounds the memory held while it lags to the capacity
-    /// times [`Settings::l0_sst_size_bytes`].
-    ///
-    /// NOTE: replayed and fencing WAL files send nothing, so the first message is the
-    /// first WAL file this writer flushes. A custom WAL set with
+    /// `tx` is dropped once this writer stops, whether it closed cleanly or was
+    /// fenced, so the consumer drains the remaining messages and then sees the channel
+    /// close.
+    /// 
+    /// Buffering unconsumed WAL files, backfill, and recovery from fencing is explitly
+    /// left to the consumer to implement.
     /// [`DbBuilder::with_wal_writer`] sends nothing.
     pub fn with_wal_flush_sender(mut self, tx: tokio::sync::mpsc::Sender<Arc<FlushedWal>>) -> Self {
         self.flushed_wal_tx = Some(tx);
