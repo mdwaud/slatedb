@@ -522,8 +522,9 @@ impl WalFlushHandler {
             if Arc::strong_count(&wal) > 1 {
                 warn!("outstanding references to wal id {} after flushing", wal_id);
             }
-            self.send_flushed_wal(wal_id, wal);
+            // notify first, so the db advances its durable seq before a consumer sees the rows
             self.notify_listener(WalEvent::WalFlushed(status));
+            self.send_flushed_wal(wal_id, wal);
         }
 
         Ok(())

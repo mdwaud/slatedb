@@ -307,7 +307,8 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// Buffering unconsumed WAL files, backfill, and recovery from fencing is explicitly
     /// left to the consumer to implement.
     ///
-    /// NOTE: a custom WAL set with [`DbBuilder::with_wal_writer`] sends nothing.
+    /// NOTE: a custom WAL set with [`DbBuilder::with_wal_writer`] sends nothing, and
+    /// neither does a disabled WAL. Both log a warning when opening.
     pub fn with_wal_flush_sender(mut self, tx: tokio::sync::mpsc::Sender<Arc<FlushedWal>>) -> Self {
         self.flushed_wal_tx = Some(tx);
         self
@@ -710,6 +711,14 @@ impl<P: Into<Path>> DbBuilder<P> {
             status_manager.clone(),
             system_clock.clone(),
         ));
+
+        if self.flushed_wal_tx.is_some() {
+            if !DbInner::wal_enabled_in_options(&self.settings) {
+                warn!("wal_flush_sender set but the wal is disabled; no wal will be sent");
+            } else if self.wal_writer_init.is_some() {
+                warn!("wal_flush_sender set but a custom wal writer is configured; no wal will be sent");
+            }
+        }
 
         let fencer = WriterFencer::new(
             status_manager.result_reader(),

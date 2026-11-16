@@ -128,8 +128,8 @@ async fn test_replay_and_fencing_wals_send_nothing() {
         "the write before the reopen should still be readable"
     );
     assert!(
-        rx.try_recv().is_err(),
-        "replay and fencing wal files must not send a message"
+        matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "replay and fencing wal files must not send a message, and must not close the channel"
     );
 
     // and: the first message is the first wal file this writer flushes
