@@ -165,7 +165,7 @@ use crate::wal;
 use crate::wal::slatedb::admin::SlateDbWalAdmin;
 use crate::wal::slatedb::store::WalTableStore;
 use crate::wal::wal_disabled::DisabledWalObserver;
-use crate::wal::{WalAdmin, WalGc, WalObserver};
+use crate::wal::{FlushedWal, WalAdmin, WalGc, WalObserver};
 use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorder;
@@ -201,6 +201,7 @@ pub struct DbBuilder<P: Into<Path>> {
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
     expected_epoch: Option<u64>,
+    flushed_wal_tx: Option<tokio::sync::mpsc::Sender<Arc<FlushedWal>>>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -234,6 +235,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             segment_extractor: None,
             wal_writer_init: None,
             expected_epoch: None,
+            flushed_wal_tx: None,
         }
     }
 
@@ -291,6 +293,24 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// WAL is used by default.
     pub fn with_wal_writer(mut self, wal_writer_init: Box<dyn wal::WriterInit>) -> Self {
         self.wal_writer_init = Some(wal_writer_init);
+        self
+    }
+
+    /// Sends the contents of each flushed WAL file to `tx`. Use this to tail the
+    /// database's durable writes in sequence number order from the writer process.
+    /// One [`FlushedWal`] is sent per WAL file, after its upload succeeds.
+    ///
+    /// `tx` is dropped once this writer stops, whether it closed cleanly or was
+    /// fenced, so the consumer drains the remaining messages and then sees the channel
+    /// close.
+    ///
+    /// Buffering unconsumed WAL files, backfill, and recovery from fencing is explicitly
+    /// left to the consumer to implement.
+    ///
+    /// NOTE: a custom WAL set with [`DbBuilder::with_wal_writer`] sends nothing, and
+    /// neither does a disabled WAL. Both log a warning when opening.
+    pub fn with_wal_flush_sender(mut self, tx: tokio::sync::mpsc::Sender<Arc<FlushedWal>>) -> Self {
+        self.flushed_wal_tx = Some(tx);
         self
     }
 
@@ -692,6 +712,14 @@ impl<P: Into<Path>> DbBuilder<P> {
             system_clock.clone(),
         ));
 
+        if self.flushed_wal_tx.is_some() {
+            if !DbInner::wal_enabled_in_options(&self.settings) {
+                warn!("wal_flush_sender set but the wal is disabled; no wal will be sent");
+            } else if self.wal_writer_init.is_some() {
+                warn!("wal_flush_sender set but a custom wal writer is configured; no wal will be sent");
+            }
+        }
+
         let fencer = WriterFencer::new(
             status_manager.result_reader(),
             recorder.clone(),
@@ -700,6 +728,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             system_clock.clone(),
             task_executor.clone(),
             self.wal_writer_init,
+            self.flushed_wal_tx,
         );
         let WriterFenceResult {
             manifest,

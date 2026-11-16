@@ -4,13 +4,14 @@ use crate::manifest::store::{FenceableManifest, StoredManifest};
 use crate::utils::WatchableOnceCellReader;
 use crate::wal::slatedb::store::WalTableStore;
 use crate::wal::slatedb::writer_init::{SlateDbWalWriterInit, SlateDbWalWriterInitOptions};
-use crate::wal::{WalIterator, WalWriter, WriterInit};
+use crate::wal::{FlushedWal, WalIterator, WalWriter, WriterInit};
 use crate::Settings;
 use fail_parallel::{fail_point_send, FailPointTx};
 use slatedb_common::metrics::MetricsRecorderHelper;
 use slatedb_common::SystemClock;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 pub(crate) struct WriterFencer {
     closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
@@ -40,6 +41,7 @@ impl WriterFencer {
         system_clock: Arc<dyn SystemClock>,
         task_executor: Arc<MessageHandlerExecutor>,
         wal_writer_init: Option<Box<dyn WriterInit>>,
+        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
     ) -> Self {
         Self::new_with_fp_handle(
             closed_result_reader,
@@ -49,6 +51,7 @@ impl WriterFencer {
             system_clock,
             task_executor,
             wal_writer_init,
+            flushed_wal_tx,
             FailPointTx::dummy(),
         )
     }
@@ -61,13 +64,14 @@ impl WriterFencer {
         system_clock: Arc<dyn SystemClock>,
         task_executor: Arc<MessageHandlerExecutor>,
         wal_writer_init: Option<Box<dyn WriterInit>>,
+        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
         fp_tx: FailPointTx,
     ) -> Self {
         Self {
             closed_result_reader,
             recorder,
             wal_store,
-            wal_writer_init_options: settings.into(),
+            wal_writer_init_options: SlateDbWalWriterInitOptions::new(settings, flushed_wal_tx),
             manifest_update_timeout: settings.manifest_update_timeout,
             system_clock,
             task_executor,
@@ -97,7 +101,7 @@ impl WriterFencer {
                     self.closed_result_reader.clone(),
                     self.recorder.clone(),
                     self.wal_store.clone(),
-                    self.wal_writer_init_options,
+                    self.wal_writer_init_options.clone(),
                     stored_manifest.manifest(),
                     self.task_executor.clone(),
                     self.fp_tx.clone(),
@@ -220,6 +224,7 @@ mod tests {
                 &settings,
                 system_clock.clone(),
                 task_executor.clone(),
+                None,
                 None,
                 fp_tx,
             );

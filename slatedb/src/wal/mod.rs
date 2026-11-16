@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use object_store::path::Path;
 use std::error::Error;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::ops::{Bound, Range, RangeFrom};
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,6 +179,36 @@ pub struct WalStatus {
     /// The number of writes currently buffered
     #[allow(dead_code)]
     pub buffered_wal_entries_count: usize,
+}
+
+/// The contents of a durably flushed WAL file
+///
+/// Sent to the channel registered with
+/// [`DbBuilder::with_wal_flush_sender`](crate::DbBuilder::with_wal_flush_sender)
+#[derive(Clone, PartialEq)]
+pub struct FlushedWal {
+    /// The id of the WAL file that holds these rows
+    pub wal_id: u64,
+    /// The sequence number of the first row
+    pub first_seq: u64,
+    /// The sequence number of the last row
+    pub last_seq: u64,
+    /// The rows in the WAL file, in sequence number order. All the rows with a given sequence
+    /// number are present in the same [`FlushedWal`].
+    pub rows: Vec<RowEntry>,
+}
+
+/// Prints the row count in place of the rows. A derived [`Debug`] would log a whole WAL file of
+/// keys and values.
+impl Debug for FlushedWal {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlushedWal")
+            .field("wal_id", &self.wal_id)
+            .field("first_seq", &self.first_seq)
+            .field("last_seq", &self.last_seq)
+            .field("rows", &self.rows.len())
+            .finish()
+    }
 }
 
 /// An event emitted by a [`WalWriter`] to subscribers.
