@@ -558,11 +558,11 @@ impl WalFlushHandler {
             return;
         };
         // a frozen WAL always holds at least one row
-        let (Some(first), Some(last)) = (wal.entries.front(), wal.entries.back()) else {
+        let (Some(first), Some(last_seq)) = (wal.entries.front(), wal.last_seq()) else {
             debug_assert!(false, "flushed an empty wal buffer [wal_id={}]", wal_id);
             return;
         };
-        let (first_seq, last_seq) = (first.seq, last.seq);
+        let first_seq = first.seq;
         // reserve a slot before taking the rows so that a lagging consumer costs nothing
         let permit = match tx.try_reserve() {
             Ok(permit) => permit,

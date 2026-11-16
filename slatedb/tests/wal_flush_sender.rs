@@ -92,7 +92,9 @@ async fn test_each_flush_sends_its_rows_in_seq_order() {
     // and: the next wal file follows it, with a contiguous sequence range
     let second = recv(&mut rx).await;
     assert_eq!(second.wal_id, first.wal_id + 1);
-    assert_eq!(second.first_seq, first.last_seq + 1);
+    // Sequence numbers only increase. They are not contiguous: an aborted transaction or an
+    // explicit `WriteOptions::seqnum` consumes a sequence number without writing a row.
+    assert!(second.first_seq > first.last_seq);
     assert_eq!(second.rows.len(), 1);
     assert_eq!(second.rows[0].key.as_ref(), b"k4");
 
