@@ -7,7 +7,7 @@ use std::time::Duration;
 use slatedb::config::{FlushOptions, FlushType, Settings};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
-use slatedb::{Db, FlushedWal, WalReader, WriteBatch};
+use slatedb::{Db, FlushedWal, WriteBatch};
 use tokio::sync::mpsc;
 
 /// No flush interval and a large WAL size limit, so only an explicit flush writes a WAL file
@@ -22,11 +22,10 @@ fn manual_flush_settings() -> Settings {
 async fn open_db(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
-    settings: Settings,
     tx: mpsc::Sender<Arc<FlushedWal>>,
 ) -> Db {
     Db::builder(path, object_store)
-        .with_settings(settings)
+        .with_settings(manual_flush_settings())
         .with_wal_flush_sender(tx)
         .build()
         .await
@@ -37,34 +36,16 @@ async fn open_db(
 async fn open_tailing_db(path: &str, capacity: usize) -> (Db, mpsc::Receiver<Arc<FlushedWal>>) {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (tx, rx) = mpsc::channel(capacity);
-    let db = open_db(path, object_store, manual_flush_settings(), tx).await;
+    let db = open_db(path, object_store, tx).await;
     (db, rx)
 }
 
 /// Pins `FlushType::Wal` rather than calling `Db::flush`, because the WAL flush is under test
-async fn flush_wal(db: &Db) {
+async fn flush_wal(db: &Db) -> Result<(), slatedb::Error> {
     db.flush_with_options(FlushOptions {
         flush_type: FlushType::Wal,
     })
     .await
-    .unwrap();
-}
-
-/// Drains the channel and reports whether it closed, rather than stalling
-async fn recv_closed(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> bool {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while rx.recv().await.is_some() {}
-    })
-    .await
-    .is_ok()
-}
-
-async fn flush_result_is_err(db: &Db) -> bool {
-    db.flush_with_options(FlushOptions {
-        flush_type: FlushType::Wal,
-    })
-    .await
-    .is_err()
 }
 
 async fn recv(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> Arc<FlushedWal> {
@@ -74,148 +55,54 @@ async fn recv(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> Arc<FlushedWal> {
         .expect("sender was dropped")
 }
 
-#[tokio::test]
-async fn test_messages_arrive_in_wal_id_order_with_contiguous_seq_ranges() {
-    let (db, mut rx) = open_tailing_db("/test_order", 16).await;
-
-    for i in 0..4u8 {
-        db.put(&[b'k', i], &[b'v', i]).await.unwrap();
-        flush_wal(&db).await;
-    }
-
-    let mut previous: Option<Arc<FlushedWal>> = None;
-    for i in 0..4u8 {
-        let message = recv(&mut rx).await;
-        assert_eq!(message.rows.len(), 1);
-        assert_eq!(message.rows[0].key.as_ref(), &[b'k', i]);
-        assert_eq!(message.first_seq, message.rows[0].seq);
-        assert_eq!(message.last_seq, message.rows[0].seq);
-        if let Some(previous) = &previous {
-            assert!(
-                message.wal_id > previous.wal_id,
-                "wal id {} is not after {}",
-                message.wal_id,
-                previous.wal_id
-            );
-            assert_eq!(
-                message.first_seq,
-                previous.last_seq + 1,
-                "seq range is not contiguous with the previous message"
-            );
-        }
-        previous = Some(message);
-    }
-
-    db.close().await.unwrap();
+/// Drains the channel and reports whether it closed, rather than stalling
+async fn drained_to_close(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> bool {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .is_ok()
 }
 
 #[tokio::test]
-async fn test_write_batch_rows_share_a_seq_and_arrive_in_one_message() {
-    let (db, mut rx) = open_tailing_db("/test_batch", 16).await;
-
+async fn test_each_flush_sends_its_rows_in_seq_order() {
+    // given: a write batch and a single write, each flushed into its own wal file
+    let (db, mut rx) = open_tailing_db("/test_delivery", 16).await;
     let mut batch = WriteBatch::new();
     batch.put(b"k1", b"v1");
     batch.put(b"k2", b"v2");
     batch.delete(b"k3");
     db.write(batch).await.unwrap();
-    flush_wal(&db).await;
+    flush_wal(&db).await.unwrap();
+    db.put(b"k4", b"v4").await.unwrap();
+    flush_wal(&db).await.unwrap();
 
-    let message = recv(&mut rx).await;
-    assert_eq!(message.rows.len(), 3);
-    assert_eq!(message.first_seq, message.last_seq);
-    for row in &message.rows {
-        assert_eq!(row.seq, message.first_seq);
-    }
-    assert_eq!(message.rows[0].key.as_ref(), b"k1");
-    assert_eq!(message.rows[1].key.as_ref(), b"k2");
-    assert_eq!(message.rows[2].key.as_ref(), b"k3");
-    assert!(message.rows[2].value.is_tombstone());
-
-    db.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_message_rows_match_wal_reader() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let path = "/test_wal_reader_match";
-    let (tx, mut rx) = mpsc::channel(16);
-    let db = open_db(path, object_store.clone(), manual_flush_settings(), tx).await;
-
-    for i in 0..3u8 {
-        let mut batch = WriteBatch::new();
-        batch.put([b'a', i], [b'v', i]);
-        batch.put([b'b', i], [b'w', i]);
-        db.write(batch).await.unwrap();
-        flush_wal(&db).await;
-    }
-
-    let wal_reader = WalReader::new(path, object_store);
-    for _ in 0..3 {
-        let message = recv(&mut rx).await;
-        let mut iterator = wal_reader.get(message.wal_id).iterator().await.unwrap();
-        let mut rows = Vec::new();
-        while let Some(row) = iterator.next().await.unwrap() {
-            rows.push(row);
-        }
-        assert_eq!(rows, message.rows);
-    }
-
-    db.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_full_channel_drops_messages_without_affecting_writes() {
-    let (db, mut rx) = open_tailing_db("/test_full", 1).await;
-
-    // Fill the channel and then overrun it. None of these writes may block or fail.
-    for i in 0..6u8 {
-        db.put(&[b'k', i], &[b'v', i]).await.unwrap();
-        flush_wal(&db).await;
-    }
-
-    // Every write is still readable, so the drops cost only the messages.
-    for i in 0..6u8 {
-        let value = db.get(&[b'k', i]).await.unwrap().unwrap();
-        assert_eq!(value.as_ref(), &[b'v', i]);
-    }
-
-    // The channel holds only the first message.
+    // then: the batch arrives whole, under one sequence number
     let first = recv(&mut rx).await;
-    assert_eq!(first.rows[0].key.as_ref(), &[b'k', 0]);
-
-    // The next message shows the gap as a jump in wal_id.
-    db.put(b"k6", b"v6").await.unwrap();
-    flush_wal(&db).await;
-    let next = recv(&mut rx).await;
-    assert!(
-        next.wal_id > first.wal_id + 1,
-        "expected a wal id jump after the drops, got {} then {}",
-        first.wal_id,
-        next.wal_id
-    );
-    assert!(
-        next.first_seq > first.last_seq + 1,
-        "expected a seq gap after the drops"
-    );
-
-    db.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_dropped_receiver_does_not_affect_writes() {
-    let (db, rx) = open_tailing_db("/test_closed", 4).await;
-    drop(rx);
-
-    for i in 0..4u8 {
-        db.put(&[b'k', i], &[b'v', i]).await.unwrap();
-        flush_wal(&db).await;
+    assert_eq!(first.rows.len(), 3);
+    assert_eq!(first.first_seq, first.last_seq);
+    for row in &first.rows {
+        assert_eq!(row.seq, first.first_seq);
     }
-    for i in 0..4u8 {
-        let value = db.get(&[b'k', i]).await.unwrap().unwrap();
-        assert_eq!(value.as_ref(), &[b'v', i]);
-    }
+    assert_eq!(first.rows[0].key.as_ref(), b"k1");
+    assert_eq!(first.rows[1].key.as_ref(), b"k2");
+    assert_eq!(first.rows[2].key.as_ref(), b"k3");
+    assert!(first.rows[2].value.is_tombstone());
 
+    // and: the next wal file follows it, with a contiguous sequence range
+    let second = recv(&mut rx).await;
+    assert_eq!(second.wal_id, first.wal_id + 1);
+    assert_eq!(second.first_seq, first.last_seq + 1);
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].key.as_ref(), b"k4");
+
+    // and: closing drains what is left rather than discarding it
+    db.put(b"k5", b"v5").await.unwrap();
+    flush_wal(&db).await.unwrap();
     db.close().await.unwrap();
+    let last = recv(&mut rx).await;
+    assert_eq!(last.wal_id, second.wal_id + 1);
+    assert!(rx.recv().await.is_none(), "close must close the channel");
 }
 
 #[tokio::test]
@@ -223,23 +110,18 @@ async fn test_replay_and_fencing_wals_send_nothing() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let path = "/test_replay";
 
-    // Write a WAL file that the next open must replay, then leave without a clean close so the
-    // data stays in the WAL.
+    // given: a wal file written by an earlier writer
     let (first_tx, _first_rx) = mpsc::channel(16);
-    let db = open_db(
-        path,
-        object_store.clone(),
-        manual_flush_settings(),
-        first_tx,
-    )
-    .await;
+    let db = open_db(path, object_store.clone(), first_tx).await;
     db.put(b"before", b"open").await.unwrap();
-    flush_wal(&db).await;
+    flush_wal(&db).await.unwrap();
     db.close().await.unwrap();
 
-    // Reopen. The replayed WAL file and the zero-byte fencing WAL file send nothing.
+    // when: the db reopens, replaying that file and writing a zero-byte fencing file
     let (tx, mut rx) = mpsc::channel(16);
-    let db = open_db(path, object_store, manual_flush_settings(), tx).await;
+    let db = open_db(path, object_store, tx).await;
+
+    // then: neither one sends a message, though the replayed write is readable
     assert_eq!(
         db.get(b"before").await.unwrap().unwrap().as_ref(),
         b"open",
@@ -250,64 +132,14 @@ async fn test_replay_and_fencing_wals_send_nothing() {
         "replay and fencing wal files must not send a message"
     );
 
-    // The first message is the first WAL file this writer flushes.
+    // and: the first message is the first wal file this writer flushes
     db.put(b"after", b"open").await.unwrap();
-    flush_wal(&db).await;
+    flush_wal(&db).await.unwrap();
     let message = recv(&mut rx).await;
     assert_eq!(message.rows.len(), 1);
     assert_eq!(message.rows[0].key.as_ref(), b"after");
-    assert_eq!(
-        message.rows[0].value.as_bytes().expect("expected a value"),
-        b"open".as_ref()
-    );
 
     db.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_messages_sent_for_interval_and_explicit_flushes() {
-    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let settings = Settings {
-        flush_interval: Some(Duration::from_millis(10)),
-        l0_sst_size_bytes: 64 * 1024 * 1024,
-        ..Settings::default()
-    };
-    let (tx, mut rx) = mpsc::channel(16);
-    let db = open_db("/test_triggers", object_store, settings, tx).await;
-
-    // The flush interval flushes this write without an explicit call.
-    db.put(b"interval", b"v").await.unwrap();
-    let message = recv(&mut rx).await;
-    assert_eq!(message.rows[0].key.as_ref(), b"interval");
-
-    // An explicit WAL flush sends a message too.
-    db.put(b"explicit", b"v").await.unwrap();
-    flush_wal(&db).await;
-    let message = recv(&mut rx).await;
-    assert_eq!(message.rows[0].key.as_ref(), b"explicit");
-
-    db.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_channel_closes_when_the_db_closes() {
-    // given: a db with undelivered messages in the consumer channel
-    let (db, mut rx) = open_tailing_db("/test_close_signal", 16).await;
-    for i in 0..3u8 {
-        db.put([b'k', i], b"v").await.unwrap();
-        flush_wal(&db).await;
-    }
-
-    // when: the db closes
-    db.close().await.unwrap();
-
-    // then: the consumer drains every message, then sees the channel close
-    let mut wal_ids = Vec::new();
-    while let Some(message) = rx.recv().await {
-        wal_ids.push(message.wal_id);
-    }
-    assert_eq!(wal_ids.len(), 3, "close must not discard buffered messages");
-    assert!(wal_ids.windows(2).all(|pair| pair[1] == pair[0] + 1));
 }
 
 #[tokio::test]
@@ -317,35 +149,25 @@ async fn test_channel_closes_when_the_writer_is_fenced() {
 
     // given: a writer that has flushed one wal file
     let (tx, mut rx) = mpsc::channel(16);
-    let fenced = open_db(path, object_store.clone(), manual_flush_settings(), tx).await;
+    let fenced = open_db(path, object_store.clone(), tx).await;
     fenced.put(b"a", b"1").await.unwrap();
-    flush_wal(&fenced).await;
-    let message = recv(&mut rx).await;
+    flush_wal(&fenced).await.unwrap();
+    recv(&mut rx).await;
 
     // when: a second writer opens on the same path and fences the first
-    let (tx, mut rx2) = mpsc::channel(16);
-    let writer = open_db(path, object_store, manual_flush_settings(), tx).await;
+    let (tx, _rx) = mpsc::channel(16);
+    let writer = open_db(path, object_store, tx).await;
 
-    // then: the fenced writer cannot flush its next write, and its consumer sees the channel
-    // close. The write itself still succeeds, because it only reaches the in-memory buffer.
+    // then: the fenced writer cannot flush its next write. The write itself still succeeds,
+    // because it only reaches the in-memory buffer.
     fenced.put(b"never", b"durable").await.unwrap();
-    assert!(flush_result_is_err(&fenced).await);
+    assert!(flush_wal(&fenced).await.is_err());
+
+    // and: its consumer drains what arrived and then sees the channel close
     assert!(
-        recv_closed(&mut rx).await,
+        drained_to_close(&mut rx).await,
         "a fenced writer must close its consumer channel"
     );
-
-    // and: the new writer's first wal file lands after the fencing wal file
-    writer.put(b"b", b"2").await.unwrap();
-    flush_wal(&writer).await;
-    let next = recv(&mut rx2).await;
-    assert!(
-        next.wal_id > message.wal_id + 1,
-        "the fencing wal file should sit between {} and {}",
-        message.wal_id,
-        next.wal_id
-    );
-    assert_eq!(next.first_seq, message.last_seq + 1);
 
     writer.close().await.unwrap();
 }

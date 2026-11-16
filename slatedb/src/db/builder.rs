@@ -303,10 +303,11 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// `tx` is dropped once this writer stops, whether it closed cleanly or was
     /// fenced, so the consumer drains the remaining messages and then sees the channel
     /// close.
-    /// 
-    /// Buffering unconsumed WAL files, backfill, and recovery from fencing is explitly
+    ///
+    /// Buffering unconsumed WAL files, backfill, and recovery from fencing is explicitly
     /// left to the consumer to implement.
-    /// [`DbBuilder::with_wal_writer`] sends nothing.
+    ///
+    /// NOTE: a custom WAL set with [`DbBuilder::with_wal_writer`] sends nothing.
     pub fn with_wal_flush_sender(mut self, tx: tokio::sync::mpsc::Sender<Arc<FlushedWal>>) -> Self {
         self.flushed_wal_tx = Some(tx);
         self
