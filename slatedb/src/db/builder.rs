@@ -165,7 +165,7 @@ use crate::wal;
 use crate::wal::slatedb::admin::SlateDbWalAdmin;
 use crate::wal::slatedb::store::WalTableStore;
 use crate::wal::wal_disabled::DisabledWalObserver;
-use crate::wal::{WalAdmin, WalGc, WalObserver};
+use crate::wal::{FlushedWal, WalAdmin, WalGc, WalObserver};
 use slatedb_common::clock::DefaultSystemClock;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorder;
@@ -201,6 +201,7 @@ pub struct DbBuilder<P: Into<Path>> {
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
     expected_epoch: Option<u64>,
+    flushed_wal_tx: Option<tokio::sync::mpsc::Sender<Arc<FlushedWal>>>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -234,6 +235,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             segment_extractor: None,
             wal_writer_init: None,
             expected_epoch: None,
+            flushed_wal_tx: None,
         }
     }
 
@@ -291,6 +293,36 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// WAL is used by default.
     pub fn with_wal_writer(mut self, wal_writer_init: Box<dyn wal::WriterInit>) -> Self {
         self.wal_writer_init = Some(wal_writer_init);
+        self
+    }
+
+    /// Sends each flushed WAL file to `tx`, so an in-process consumer can tail the database's
+    /// committed, durable writes in sequence number order without reading WAL files back from
+    /// object storage.
+    ///
+    /// SlateDB sends one [`FlushedWal`] per WAL flush, after the WAL file upload succeeds. The
+    /// rows are in sequence number order, and all rows of one write batch share a sequence number
+    /// and are in the same message.
+    ///
+    /// The send never blocks or fails a write. SlateDB uses
+    /// [`try_send`](tokio::sync::mpsc::Sender::try_send) semantics:
+    /// - A full channel drops the message. The consumer sees the gap as a jump in
+    ///   [`FlushedWal::wal_id`] and reads the missing files with [`crate::WalReader`]. SlateDB
+    ///   counts drops in the `slatedb.wal.flushed_wal_drops` metric.
+    /// - A closed channel is ignored.
+    ///
+    /// The consumer owns the channel and picks its capacity. The memory held while the consumer
+    /// lags is at most the capacity times [`Settings::l0_sst_size_bytes`].
+    ///
+    /// SlateDB sends nothing for WAL files replayed when the database opens, and nothing for
+    /// zero-byte fencing WAL files. The first message is the first WAL file this writer flushes
+    /// after it opens. Only the writer sends messages; [`crate::DbReader`] sends none. A custom
+    /// WAL set with [`DbBuilder::with_wal_writer`] sends none.
+    ///
+    /// This option is on the builder, not on [`Settings`], because a
+    /// [`Sender`](tokio::sync::mpsc::Sender) cannot be serialized.
+    pub fn with_wal_flush_sender(mut self, tx: tokio::sync::mpsc::Sender<Arc<FlushedWal>>) -> Self {
+        self.flushed_wal_tx = Some(tx);
         self
     }
 
@@ -700,6 +732,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             system_clock.clone(),
             task_executor.clone(),
             self.wal_writer_init,
+            self.flushed_wal_tx,
         );
         let WriterFenceResult {
             manifest,

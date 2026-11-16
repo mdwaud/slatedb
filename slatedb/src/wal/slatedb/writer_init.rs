@@ -6,29 +6,37 @@ use crate::wal::slatedb::iterator::{
     SlateDbWalIterator, SlateDbWalIteratorOptions, WalIteratorEndBound,
 };
 use crate::wal::slatedb::writer::SlateDbWalWriter;
-use crate::wal::{WalError, WriterInitResult, WriterManifest};
+use crate::wal::{FlushedWal, WalError, WriterInitResult, WriterManifest};
 use crate::{wal, Settings};
 use async_trait::async_trait;
 use fail_parallel::{fail_point_send, FailPointTx};
 use slatedb_common::metrics::MetricsRecorderHelper;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use super::store::WalTableStore;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_bytes_size: usize,
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
+    /// Receives one message per flushed WAL file. Set by
+    /// [`crate::DbBuilder::with_wal_flush_sender`].
+    flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
 }
 
-impl From<&Settings> for SlateDbWalWriterInitOptions {
-    fn from(settings: &Settings) -> Self {
+impl SlateDbWalWriterInitOptions {
+    pub(crate) fn new(
+        settings: &Settings,
+        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+    ) -> Self {
         Self {
             max_wal_bytes_size: settings.l0_sst_size_bytes,
             max_wal_flushes_before_l0_flush: settings.max_wal_flushes_before_l0_flush,
             max_flush_interval: settings.flush_interval,
+            flushed_wal_tx,
         }
     }
 }
@@ -37,9 +45,7 @@ pub(crate) struct SlateDbWalWriterInit {
     closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
     recorder: MetricsRecorderHelper,
     table_store: Arc<WalTableStore>,
-    max_wal_bytes_size: usize,
-    max_wal_flushes_before_l0_flush: u64,
-    max_flush_interval: Option<Duration>,
+    options: SlateDbWalWriterInitOptions,
     empty_wal_id: u64,
     task_executor: Arc<MessageHandlerExecutor>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -65,9 +71,7 @@ impl SlateDbWalWriterInit {
             closed_result_reader,
             recorder,
             table_store,
-            max_wal_bytes_size: options.max_wal_bytes_size,
-            max_wal_flushes_before_l0_flush: options.max_wal_flushes_before_l0_flush,
-            max_flush_interval: options.max_flush_interval,
+            options,
             empty_wal_id,
             task_executor,
             fp_tx,
@@ -130,10 +134,11 @@ impl wal::WriterInit for SlateDbWalWriterInit {
                     &self.recorder,
                     empty_wal_id,
                     self.table_store.clone(),
-                    self.max_wal_bytes_size,
-                    self.max_wal_flushes_before_l0_flush,
-                    self.max_flush_interval,
+                    self.options.max_wal_bytes_size,
+                    self.options.max_wal_flushes_before_l0_flush,
+                    self.options.max_flush_interval,
                     self.task_executor.clone(),
+                    self.options.flushed_wal_tx.clone(),
                 )
                 .await?;
                 let result = WriterInitResult {
