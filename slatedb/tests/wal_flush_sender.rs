@@ -8,7 +8,7 @@ use slatedb::config::{FlushOptions, FlushType, Settings};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, FlushedWal, WriteBatch};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 /// No flush interval and a large WAL size limit, so only an explicit flush writes a WAL file
 fn manual_flush_settings() -> Settings {
@@ -22,7 +22,7 @@ fn manual_flush_settings() -> Settings {
 async fn open_db(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
-    tx: mpsc::Sender<Arc<FlushedWal>>,
+    tx: broadcast::Sender<Arc<FlushedWal>>,
 ) -> Db {
     Db::builder(path, object_store)
         .with_settings(manual_flush_settings())
@@ -33,9 +33,12 @@ async fn open_db(
 }
 
 /// Opens a db on a fresh in-memory store with a consumer channel of `capacity`
-async fn open_tailing_db(path: &str, capacity: usize) -> (Db, mpsc::Receiver<Arc<FlushedWal>>) {
+async fn open_tailing_db(
+    path: &str,
+    capacity: usize,
+) -> (Db, broadcast::Receiver<Arc<FlushedWal>>) {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (tx, rx) = mpsc::channel(capacity);
+    let (tx, rx) = broadcast::channel(capacity);
     let db = open_db(path, object_store, tx).await;
     (db, rx)
 }
@@ -48,17 +51,17 @@ async fn flush_wal(db: &Db) -> Result<(), slatedb::Error> {
     .await
 }
 
-async fn recv(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> Arc<FlushedWal> {
+async fn recv(rx: &mut broadcast::Receiver<Arc<FlushedWal>>) -> Arc<FlushedWal> {
     tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("timed out waiting for a flushed wal")
-        .expect("sender was dropped")
+        .expect("channel closed or lagged")
 }
 
 /// Drains the channel and reports whether it closed, rather than stalling
-async fn drained_to_close(rx: &mut mpsc::Receiver<Arc<FlushedWal>>) -> bool {
+async fn drained_to_close(rx: &mut broadcast::Receiver<Arc<FlushedWal>>) -> bool {
     tokio::time::timeout(Duration::from_secs(10), async {
-        while rx.recv().await.is_some() {}
+        while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {}
     })
     .await
     .is_ok()
@@ -104,7 +107,10 @@ async fn test_each_flush_sends_its_rows_in_seq_order() {
     db.close().await.unwrap();
     let last = recv(&mut rx).await;
     assert_eq!(last.wal_id, second.wal_id + 1);
-    assert!(rx.recv().await.is_none(), "close must close the channel");
+    assert!(
+        matches!(rx.recv().await, Err(broadcast::error::RecvError::Closed)),
+        "close must close the channel"
+    );
 }
 
 #[tokio::test]
@@ -113,14 +119,14 @@ async fn test_replay_and_fencing_wals_send_nothing() {
     let path = "/test_replay";
 
     // given: a wal file written by an earlier writer
-    let (first_tx, _first_rx) = mpsc::channel(16);
+    let (first_tx, _first_rx) = broadcast::channel(16);
     let db = open_db(path, object_store.clone(), first_tx).await;
     db.put(b"before", b"open").await.unwrap();
     flush_wal(&db).await.unwrap();
     db.close().await.unwrap();
 
     // when: the db reopens, replaying that file and writing a zero-byte fencing file
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = broadcast::channel(16);
     let db = open_db(path, object_store, tx).await;
 
     // then: neither one sends a message, though the replayed write is readable
@@ -130,7 +136,7 @@ async fn test_replay_and_fencing_wals_send_nothing() {
         "the write before the reopen should still be readable"
     );
     assert!(
-        matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
         "replay and fencing wal files must not send a message, and must not close the channel"
     );
 
@@ -150,19 +156,18 @@ async fn test_channel_closes_when_the_writer_is_fenced() {
     let path = "/test_fenced_signal";
 
     // given: a writer that has flushed one wal file
-    let (tx, mut rx) = mpsc::channel(16);
+    let (tx, mut rx) = broadcast::channel(16);
     let fenced = open_db(path, object_store.clone(), tx).await;
     fenced.put(b"a", b"1").await.unwrap();
     flush_wal(&fenced).await.unwrap();
     recv(&mut rx).await;
 
     // when: a second writer opens on the same path and fences the first
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, _rx) = broadcast::channel(16);
     let writer = open_db(path, object_store, tx).await;
 
-    // then: the fenced writer cannot flush its next write. The write itself still succeeds,
-    // because it only reaches the in-memory buffer.
-    fenced.put(b"never", b"durable").await.unwrap();
+    // then: only the flush must fail. The write may reach the buffer, or already see the fence.
+    let _ = fenced.put(b"never", b"durable").await;
     assert!(flush_wal(&fenced).await.is_err());
 
     // and: its consumer drains what arrived and then sees the channel close

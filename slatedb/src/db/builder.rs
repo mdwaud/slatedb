@@ -201,7 +201,7 @@ pub struct DbBuilder<P: Into<Path>> {
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
     expected_epoch: Option<u64>,
-    flushed_wal_tx: Option<tokio::sync::mpsc::Sender<Arc<FlushedWal>>>,
+    flushed_wal_tx: Option<tokio::sync::broadcast::Sender<Arc<FlushedWal>>>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -296,20 +296,31 @@ impl<P: Into<Path>> DbBuilder<P> {
         self
     }
 
-    /// Sends the contents of each flushed WAL file to `tx`. Use this to tail the
-    /// database's durable writes in sequence number order from the writer process.
-    /// One [`FlushedWal`] is sent per WAL file, after its upload succeeds.
+    /// Sends the contents of each flushed WAL file to every subscriber of `tx`, so
+    /// consumers can tail the database's durable writes in sequence number order. One
+    /// [`FlushedWal`] is sent per WAL file, after its upload succeeds.
     ///
-    /// `tx` is dropped once this writer stops, whether it closed cleanly or was
-    /// fenced, so the consumer drains the remaining messages and then sees the channel
-    /// close.
+    /// The send never blocks or fails a write. Capacity counts messages, and a full ring
+    /// overwrites its oldest. A consumer that falls behind reads the count it missed from
+    /// `RecvError::Lagged`, and the ids from the jump in [`FlushedWal::wal_id`], which is
+    /// otherwise contiguous.
+    ///
+    /// `tx` is dropped once this writer stops, cleanly or fenced, so the consumer drains
+    /// the retained messages and then sees the channel close. Add consumers with
+    /// [`Receiver::resubscribe`](tokio::sync::broadcast::Receiver::resubscribe).
     ///
     /// Buffering unconsumed WAL files, backfill, and recovery from fencing is explicitly
     /// left to the consumer to implement.
     ///
+    /// NOTE: never keep a clone of `tx`. A live sender suppresses the close signal and
+    /// leaves the consumer waiting.
+    ///
     /// NOTE: a custom WAL set with [`DbBuilder::with_wal_writer`] sends nothing, and
     /// neither does a disabled WAL. Both log a warning when opening.
-    pub fn with_wal_flush_sender(mut self, tx: tokio::sync::mpsc::Sender<Arc<FlushedWal>>) -> Self {
+    pub fn with_wal_flush_sender(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<Arc<FlushedWal>>,
+    ) -> Self {
         self.flushed_wal_tx = Some(tx);
         self
     }

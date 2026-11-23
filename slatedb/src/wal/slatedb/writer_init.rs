@@ -13,7 +13,7 @@ use fail_parallel::{fail_point_send, FailPointTx};
 use slatedb_common::metrics::MetricsRecorderHelper;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use super::store::WalTableStore;
 
@@ -23,13 +23,13 @@ pub(crate) struct SlateDbWalWriterInitOptions {
     max_wal_flushes_before_l0_flush: u64,
     max_flush_interval: Option<Duration>,
     /// Set by [`crate::DbBuilder::with_wal_flush_sender`]. Comes from the caller, not [`Settings`]
-    flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+    flushed_wal_tx: Option<broadcast::Sender<Arc<FlushedWal>>>,
 }
 
 impl SlateDbWalWriterInitOptions {
     pub(crate) fn new(
         settings: &Settings,
-        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+        flushed_wal_tx: Option<broadcast::Sender<Arc<FlushedWal>>>,
     ) -> Self {
         Self {
             max_wal_bytes_size: settings.l0_sst_size_bytes,

@@ -11,7 +11,7 @@ use slatedb_common::metrics::MetricsRecorderHelper;
 use slatedb_common::SystemClock;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 pub(crate) struct WriterFencer {
     closed_result_reader: WatchableOnceCellReader<Result<(), SlateDBError>>,
@@ -41,7 +41,7 @@ impl WriterFencer {
         system_clock: Arc<dyn SystemClock>,
         task_executor: Arc<MessageHandlerExecutor>,
         wal_writer_init: Option<Box<dyn WriterInit>>,
-        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+        flushed_wal_tx: Option<broadcast::Sender<Arc<FlushedWal>>>,
     ) -> Self {
         Self::new_with_fp_handle(
             closed_result_reader,
@@ -64,7 +64,7 @@ impl WriterFencer {
         system_clock: Arc<dyn SystemClock>,
         task_executor: Arc<MessageHandlerExecutor>,
         wal_writer_init: Option<Box<dyn WriterInit>>,
-        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+        flushed_wal_tx: Option<broadcast::Sender<Arc<FlushedWal>>>,
         fp_tx: FailPointTx,
     ) -> Self {
         Self {

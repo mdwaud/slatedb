@@ -183,7 +183,7 @@ pub struct WalStatus {
 
 /// The contents of a durably flushed WAL file
 ///
-/// Sent to the channel registered with
+/// Broadcast to every subscriber of the channel registered with
 /// [`DbBuilder::with_wal_flush_sender`](crate::DbBuilder::with_wal_flush_sender)
 #[derive(Clone, PartialEq)]
 pub struct FlushedWal {

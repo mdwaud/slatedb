@@ -10,6 +10,8 @@ Change data capture (CDC) turns writes in SlateDB into a durable change stream t
 
 The reader opens a live iterator from the first unconsumed WAL file ID. The iterator owns polling and waits internally when it reaches the current WAL tail; the caller owns durable cursor storage.
 
+{/* TODO: document live WAL tailing through DbBuilder::with_wal_flush_sender, and show it in the example. */}
+
 ## When to use WAL-based CDC
 
 Use WAL-based CDC when you need:

@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use log::{error, trace, warn};
 use slatedb_common::metrics::MetricsRecorderHelper;
-use tokio::{runtime::Handle, sync::mpsc, sync::oneshot};
+use tokio::{runtime::Handle, sync::broadcast, sync::oneshot};
 use tracing::instrument;
 
 use super::store::WalTableStore;
@@ -117,7 +117,7 @@ impl SlateDbWalWriter {
         max_wal_flushes_before_l0_flush: u64,
         max_flush_interval: Option<Duration>,
         task_executor: Arc<MessageHandlerExecutor>,
-        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+        flushed_wal_tx: Option<broadcast::Sender<Arc<FlushedWal>>>,
     ) -> Result<Self, SlateDBError> {
         let current_wal = WalBuffer::new();
         let immutable_wals = VecDeque::new();
@@ -487,7 +487,7 @@ struct WalFlushHandler {
     stats: Arc<WalBufferStats>,
     listener: Option<wal::WalStatusListener>,
     /// The consumer channel set by [`crate::DbBuilder::with_wal_flush_sender`], if any
-    flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+    flushed_wal_tx: Option<broadcast::Sender<Arc<FlushedWal>>>,
 }
 
 impl WalFlushHandler {
@@ -548,8 +548,8 @@ impl WalFlushHandler {
         Ok(())
     }
 
-    /// Sends a flushed WAL to the consumer channel, if one is configured. Never blocks and never
-    /// fails: a full channel drops the message and counts it, and a closed channel is ignored.
+    /// Sends a flushed WAL to every subscriber. Never blocks and never fails: a full ring
+    /// overwrites its oldest message.
     ///
     /// Takes the caller's reference to the buffer. `record_flushed_wal` already released the
     /// queue's reference, so this is normally the last one and the rows move into the message.
@@ -557,31 +557,23 @@ impl WalFlushHandler {
         let Some(tx) = self.flushed_wal_tx.as_ref() else {
             return;
         };
+        // nothing to do without a subscriber; a later one starts at the next flush
+        if tx.receiver_count() == 0 {
+            return;
+        }
         // a frozen WAL always holds at least one row
         let (Some(first), Some(last_seq)) = (wal.entries.front(), wal.last_seq()) else {
             debug_assert!(false, "flushed an empty wal buffer [wal_id={}]", wal_id);
             return;
         };
         let first_seq = first.seq;
-        // reserve a slot before taking the rows so that a lagging consumer costs nothing
-        let permit = match tx.try_reserve() {
-            Ok(permit) => permit,
-            Err(mpsc::error::TrySendError::Full(())) => {
-                self.stats.flushed_wal_drops.increment(1);
-                trace!(
-                    "dropped flushed wal message, channel is full [wal_id={}]",
-                    wal_id
-                );
-                return;
-            }
-            Err(mpsc::error::TrySendError::Closed(())) => return,
-        };
         let rows = match Arc::try_unwrap(wal) {
             Ok(buffer) => Vec::from(buffer.entries),
             // some other holder still has the buffer, so copy the rows instead
             Err(wal) => wal.entries.iter().cloned().collect(),
         };
-        permit.send(Arc::new(FlushedWal {
+        // the last subscriber can drop between the count check and this send
+        let _ = tx.send(Arc::new(FlushedWal {
             wal_id,
             first_seq,
             last_seq,
@@ -692,14 +684,12 @@ pub mod stats {
     pub const WAL_BUFFER_FLUSH_REQUESTS: &str = wal_stat_name!("wal_buffer_flush_requests");
     pub const WAL_BUFFER_ESTIMATED_BYTES: &str = wal_stat_name!("wal_buffer_estimated_bytes");
     pub const WAL_FLUSH_BYTES: &str = wal_stat_name!("wal_flush_bytes");
-    pub const WAL_FLUSHED_WAL_DROPS: &str = wal_stat_name!("flushed_wal_drops");
 
     pub(super) struct WalBufferStats {
         pub(super) estimated_bytes: Arc<dyn GaugeFn>,
         pub(super) flushes: Arc<dyn CounterFn>,
         pub(super) flush_requests: Arc<dyn CounterFn>,
         pub(super) flush_bytes: Arc<dyn CounterFn>,
-        pub(super) flushed_wal_drops: Arc<dyn CounterFn>,
     }
 
     impl WalBufferStats {
@@ -709,7 +699,6 @@ pub mod stats {
                 flushes: recorder.counter(WAL_BUFFER_FLUSHES).register(),
                 flush_requests: recorder.counter(WAL_BUFFER_FLUSH_REQUESTS).register(),
                 flush_bytes: recorder.counter(WAL_FLUSH_BYTES).register(),
-                flushed_wal_drops: recorder.counter(WAL_FLUSHED_WAL_DROPS).register(),
             }
         }
     }
@@ -881,7 +870,7 @@ mod tests {
     async fn setup_wal_buffer_with_args(
         flush_interval: Option<Duration>,
         listener: wal::WalStatusListener,
-        flushed_wal_tx: Option<mpsc::Sender<Arc<FlushedWal>>>,
+        flushed_wal_tx: Option<broadcast::Sender<Arc<FlushedWal>>>,
     ) -> (
         SlateDbWalWriter,
         Arc<WalTableStore>,
@@ -1191,7 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn test_flushed_wal_sent_to_consumer_channel() {
         // given: a writer with a consumer channel
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = broadcast::channel(4);
         let (mut wal_buffer, _, _, _) =
             setup_wal_buffer_with_args(Some(Duration::MAX), Arc::new(|_| {}), Some(tx)).await;
 
@@ -1230,10 +1219,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_consumer_channel_counts_dropped_messages() {
-        // given: a writer with a consumer channel that holds one message
-        let (tx, mut rx) = mpsc::channel(1);
-        let (mut wal_buffer, _, _, recorder) =
+    async fn test_lagging_consumer_sees_lagged_then_resumes() {
+        // given: a writer whose consumer channel retains one message
+        let (tx, mut rx) = broadcast::channel(1);
+        let (mut wal_buffer, _, _, _) =
             setup_wal_buffer_with_args(Some(Duration::MAX), Arc::new(|_| {}), Some(tx)).await;
 
         // when: three wal files are flushed without the consumer reading any of them
@@ -1245,28 +1234,45 @@ mod tests {
             wal_buffer.flush().await.unwrap().completion.await.unwrap();
         }
 
-        // then: the writer kept the first message and counted the two it dropped
-        assert_eq!(
-            lookup_metric(&recorder, stats::WAL_FLUSHED_WAL_DROPS).unwrap(),
-            2
-        );
-        let first = rx.recv().await.unwrap();
-        assert_eq!(first.wal_id, 1);
+        // then: the consumer learns it missed the two the ring overwrote
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(2))
+        ));
 
-        // and: the next flush shows the gap as a jump in wal id
-        wal_buffer
-            .append(&[make_entry("key4", "value", 4, None)])
-            .await
-            .unwrap();
-        wal_buffer.flush().await.unwrap().completion.await.unwrap();
+        // and: it resumes at the newest wal file, which shows the same gap in wal id
         let next = rx.recv().await.unwrap();
-        assert_eq!(next.wal_id, 4);
+        assert_eq!(next.wal_id, 3);
     }
 
     #[tokio::test]
-    async fn test_closed_consumer_channel_does_not_fail_flush() {
+    async fn test_each_subscriber_receives_the_flushed_wal() {
+        // given: two subscribers. A retained sender clone would stop the channel closing.
+        let (tx, mut first) = broadcast::channel(4);
+        let mut second = first.resubscribe();
+        let (mut wal_buffer, _, _, _) =
+            setup_wal_buffer_with_args(Some(Duration::MAX), Arc::new(|_| {}), Some(tx)).await;
+
+        // when: one wal file is flushed
+        wal_buffer
+            .append(&[make_entry("key1", "value1", 1, None)])
+            .await
+            .unwrap();
+        wal_buffer.flush().await.unwrap().completion.await.unwrap();
+
+        // then: both subscribers receive it
+        let a = first.recv().await.unwrap();
+        let b = second.recv().await.unwrap();
+        assert_eq!(a.wal_id, 1);
+        assert_eq!(b.wal_id, 1);
+        assert_eq!(a.rows, b.rows);
+        assert!(Arc::ptr_eq(&a, &b), "subscribers should share one message");
+    }
+
+    #[tokio::test]
+    async fn test_no_subscriber_does_not_fail_flush() {
         // given: a writer whose consumer dropped the receiver
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = broadcast::channel(4);
         drop(rx);
         let (mut wal_buffer, _, _, _) =
             setup_wal_buffer_with_args(Some(Duration::MAX), Arc::new(|_| {}), Some(tx)).await;
